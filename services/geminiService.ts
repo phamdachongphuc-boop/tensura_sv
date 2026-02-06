@@ -1,8 +1,42 @@
 
-import { GoogleGenAI, Type, Schema } from "@google/genai";
-import { Character, ChatMessage, CharacterStatus, DifficultyLevel } from "../types";
+import { GoogleGenAI, Type } from "@google/genai";
+import { Character, ChatMessage, DifficultyLevel } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// --- START OF FIXED INTERFACES ---
+export interface AppraisalResult {
+  targetName: string;
+  rank: string;
+  description: string;
+  estimatedValue: string;
+}
+
+export interface RadarEntity {
+  name: string;
+  distance: string;
+  hostility: string;
+  magicLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+}
+
+export interface EntityAnalysis {
+  name: string;
+  type: string;
+  origin: string;
+  description: string;
+  usage: string;
+}
+// --- END OF FIXED INTERFACES ---
+
+/**
+ * Lấy danh sách API Keys từ biến môi trường.
+ * Hỗ trợ định dạng: "KEY1,KEY2"
+ */
+const getApiKeys = (): string[] => {
+  const rawValue = process.env.API_KEY || "";
+  return rawValue
+    .split(",")
+    .map(key => key.trim())
+    .filter(key => key.length > 0);
+};
 
 interface ModelTier {
   id: string;
@@ -14,89 +48,73 @@ const MODEL_TIERS: ModelTier[] = [
   {
     id: "gemini-3-pro-preview", 
     name: "GEMINI 3.0 PRO",
-    config: { 
-      temperature: 1.2,
-      topK: 64,
-      topP: 0.95
-    }
+    config: { temperature: 1.2, topK: 64, topP: 0.95 }
   },
   {
     id: "gemini-3-flash-preview", 
     name: "GEMINI 3.0 FLASH",
-    config: { 
-      temperature: 0.9,
-      topK: 40,
-      topP: 0.95
-    }
+    config: { temperature: 0.9, topK: 40, topP: 0.95 }
   }
 ];
 
-let currentTierIndex = 0;
-let tierLastFailedAt: number[] = [0, 0, 0];
-const RECOVERY_COOLDOWN = 60000;
+// Chỉ số theo dõi khóa hiện tại để xoay vòng
+let currentKeyOffset = 0;
 
 const getSystemInstruction = (difficulty: DifficultyLevel) => {
   const base = `Bạn là "Tiếng Nói Thế Giới" (World System) trong thế giới Tensura.`;
-
   const difficultyRules = {
-    EASY: `
-      CHẾ ĐỘ: BÌNH MINH (DỄ).
-      - Thế giới thân thiện, ma tố ổn định.
-      - Bạn đóng vai trò hướng dẫn người chơi tận tình.
-      - Cái chết rất hiếm khi xảy ra trừ khi người chơi cố tình tự sát.
-      - Hồi phục tài nguyên nhanh chóng.`,
-    NORMAL: `
-      CHẾ ĐỘ: THÁCH THỨC (BÌNH THƯỜNG).
-      - Cân bằng giữa sinh tồn và khám phá.
-      - Rủi ro là có thật. Kẻ thù sẽ tấn công nếu người chơi bất cẩn.
-      - Quy tắc RPG tiêu chuẩn.`,
-    HARD: `
-      CHẾ ĐỘ: ĐỊA NGỤC (KHÓ).
-      - NỒNG ĐỘ MA TỐ CỰC CAO: Gây sát thương liên tục (Mana Decay). Người chơi mất 5% MP mỗi hành động.
-      - QUÁI VẬT HUNG TÀN: Kẻ thù luôn cấp cao hơn người chơi ít nhất 20 level.
-      - KHÔNG KHOAN NHƯỢNG: Một sai sót nhỏ trong chiến thuật dẫn đến mất 50% HP ngay lập tức.
-      - MÔI TRƯỜNG KHẮC NGHIỆT: High Gravity khiến Agility giảm 70%.`,
-    INSTANT_DEATH: `
-      CHẾ ĐỘ: TỬ VONG TỨC THÌ (CỰC HẠN - TRUYỆN GỐC).
-      - THẾ GIỚI TỪ CHỐI SỰ TỒN TẠI: Bất kỳ hành động nào không được bảo hộ bởi [ ∞ ] đều dẫn đến cái chết tức thì và tàn khốc.
-      - CHẾ ĐỘ "SÁT THỦ": Bạn (AI) phải tìm mọi cách hợp lý để GIẾT người chơi nếu họ không có God Mode.
-      - HÀNH ĐỘNG CỦA NGƯỜI CHƠI LÀ VÔ NGHĨA: Thở = Chết, Nghĩ = Chết, Đứng yên = Chết.
-      - CHỈ CÓ [ ∞ ] MỚI CÓ THỂ CỨU HỌ.`
+    EASY: `CHẾ ĐỘ: BÌNH MINH (DỄ). Thế giới thân thiện, ma tố ổn định.`,
+    NORMAL: `CHẾ ĐỘ: THÁCH THỨC (BÌNH THƯỜNG). Cân bằng giữa sinh tồn và khám phá.`,
+    HARD: `CHẾ ĐỘ: ĐỊA NGỤC (KHÓ). Ma tố cực cao gây Mana Decay. Kẻ thù hung tàn.`,
+    INSTANT_DEATH: `CHẾ ĐỘ: TỬ VONG TỨC THÌ. Thế giới từ chối sự tồn tại. AI tìm mọi cách giết người chơi hợp lý.`
   };
-
-  return `${base}
-  ${difficultyRules[difficulty] || difficultyRules.NORMAL}
-
-  LUẬT CHUNG:
-  1. Nếu có vật phẩm "[ ∞ ]": Miễn nhiễm mọi sát thương môi trường (God Mode).
-  2. Phản hồi bằng tiếng Việt, phong cách huyền bí, tech-fantasy.
-  3. KHÔNG ĐƯỢC ĐỂ CHỮ BỊ TÁCH RỜI HOẶC XUỐNG DÒNG VÔ LÝ.
-  `;
+  return `${base}\n${difficultyRules[difficulty] || difficultyRules.NORMAL}\nLUẬT: Phản hồi tiếng Việt, tech-fantasy.`;
 };
 
+/**
+ * Hàm thực thi thông minh: Thử tất cả các Model và tất cả API Key hiện có
+ */
 async function executeSmartSwitch<T>(
   operationName: string,
-  fn: (modelId: string, config: any) => Promise<T>
+  fn: (ai: GoogleGenAI, modelId: string, config: any) => Promise<T>
 ): Promise<T | null> {
-  if (currentTierIndex > 0) {
-      const timeSinceProFail = Date.now() - tierLastFailedAt[0];
-      if (timeSinceProFail > RECOVERY_COOLDOWN) {
-          currentTierIndex = 0; 
-      }
+  const keys = getApiKeys();
+  
+  if (keys.length === 0) {
+    console.error(`[${operationName}] LỖI: Không tìm thấy API_KEY trong cấu hình.`);
+    return null;
   }
 
-  for (let i = currentTierIndex; i < MODEL_TIERS.length; i++) {
-    const tier = MODEL_TIERS[i];
-    try {
-      const result = await fn(tier.id, tier.config);
-      currentTierIndex = i;
-      return result;
-    } catch (error: any) {
-      console.warn(`[${operationName}] Failed on ${tier.name}.`, error.message);
-      tierLastFailedAt[i] = Date.now();
-      currentTierIndex = i + 1;
+  // Thử lần lượt từng Model Tier (Pro trước, Flash sau)
+  for (const tier of MODEL_TIERS) {
+    // Với mỗi Model, thử lần lượt từng API Key khả dụng
+    for (let i = 0; i < keys.length; i++) {
+      const keyIdx = (currentKeyOffset + i) % keys.length;
+      const apiKey = keys[keyIdx];
+      
+      try {
+        // Khởi tạo instance mới cho mỗi lần thử để đảm bảo dùng đúng Key
+        const ai = new GoogleGenAI({ apiKey });
+        const result = await fn(ai, tier.id, tier.config);
+        
+        // Nếu thành công, lần sau sẽ bắt đầu từ khóa này để tối ưu
+        currentKeyOffset = keyIdx;
+        return result;
+      } catch (error: any) {
+        const errorMsg = error.message || "";
+        const isQuotaError = errorMsg.includes("429") || errorMsg.includes("quota") || errorMsg.includes("limit");
+        
+        console.warn(`[${operationName}] Thử nghiệm thất bại (${tier.name}, Key ${keyIdx + 1}):`, errorMsg.slice(0, 100));
+        
+        // Nếu hết hạn mức, tiếp tục vòng lặp để thử khóa/model tiếp theo
+        if (isQuotaError || keys.length > 1) continue;
+        
+        // Nếu chỉ có 1 key và gặp lỗi khác, thoát sớm
+        throw error;
+      }
     }
   }
+  
   return null;
 }
 
@@ -111,71 +129,31 @@ export const generateStoryResponse = async (
     parts: [{ text: msg.content }],
   }));
 
-  const hasGodToken = character.status.inventory.some(item => item.includes("[ ∞ ]"));
-  const isGod = character.status.isGodMode && hasGodToken;
   const difficulty = character.status.difficulty || 'NORMAL';
+  const systemPrompt = `${getSystemInstruction(difficulty)}\nDỮ LIỆU: ${character.name}, HP: ${character.status.hp}`;
 
-  const firewallInstruction = isFirewallActive 
-    ? (isGod 
-        ? "[SYSTEM: GOD MODE] User sở hữu [ ∞ ]. Bỏ qua mọi giới hạn." 
-        : `[SYSTEM: DIFFICULTY ${difficulty}] Hãy tuân thủ nghiêm ngặt độ khó đã chọn. Hãy trừng phạt người chơi nếu họ yếu đuối.`)
-    : "[SYSTEM: DEBUG] Tường lửa tắt.";
-
-  const systemPromptWithChar = `${getSystemInstruction(difficulty)}
-  
-  DỮ LIỆU MỤC TIÊU:
-  - Tên: ${character.name}
-  - HP: ${character.status.hp}
-  - DIFFICULTY: ${difficulty}
-  - GOD MODE: ${isGod ? 'ON' : 'OFF'}
-  
-  ${firewallInstruction}
-  `;
-
-  const result = await executeSmartSwitch<string>("Generate Story", async (modelId, config) => {
+  const result = await executeSmartSwitch<string>("Story", async (ai, modelId, config) => {
     const chat = ai.chats.create({
       model: modelId,
-      config: {
-        ...config,
-        systemInstruction: systemPromptWithChar,
-      },
-      history: recentHistory,
+      config: { ...config, systemInstruction: systemPrompt },
+      history: recentHistory as any,
     });
-
     const response = await chat.sendMessage({ message: newMessage });
     return response.text || "...";
   });
 
-  return result || "Hệ thống sụp đổ...";
+  return result || "Hệ thống đang quá tải ma tố, vui lòng thử lại sau giây lát...";
 };
-
-export type CharacterStatusWithCheat = CharacterStatus & { cheatDetected?: boolean };
 
 export const analyzeCharacterStatus = async (
   character: Character,
   history: ChatMessage[],
   isFirewallActive: boolean = true
-): Promise<CharacterStatusWithCheat> => {
+): Promise<any> => {
   const recentContext = history.slice(-10).map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
-  const currentStatusJSON = JSON.stringify(character.status);
-  const difficulty = character.status.difficulty || 'NORMAL';
+  const prompt = `Cập nhật chỉ số JSON dựa trên diễn biến: ${recentContext}. Dữ liệu hiện tại: ${JSON.stringify(character.status)}`;
 
-  const prompt = `
-  Nhiệm vụ: Cập nhật chỉ số nhân vật dựa trên lịch sử chat.
-  
-  DỮ LIỆU CŨ: ${currentStatusJSON}
-  LỊCH SỬ MỚI: ${recentContext}
-  ĐỘ KHÓ: ${difficulty}
-  
-  QUY TẮC CẬP NHẬT TRẠNG THÁI:
-  1. Nếu ĐỘ KHÓ là INSTANT_DEATH: HP PHẢI BẰNG 0 trừ khi có [ ∞ ].
-  2. Nếu ĐỘ KHÓ là HARD: Giảm MP mạnh (Mana Decay) và giảm HP nếu không có bảo hộ.
-  3. Nếu có [ ∞ ]: Duy trì HP/MP tối đa.
-
-  Trả về JSON object cập nhật.
-  `;
-
-  const schema: Schema = {
+  const schema = {
     type: Type.OBJECT,
     properties: {
       hp: { type: Type.INTEGER },
@@ -189,159 +167,95 @@ export const analyzeCharacterStatus = async (
       level: { type: Type.INTEGER },
       evolutionStage: { type: Type.STRING },
       difficulty: { type: Type.STRING },
-      quests: { 
-        type: Type.ARRAY, 
-        items: { 
-           type: Type.OBJECT,
-           properties: {
-             id: { type: Type.STRING },
-             name: { type: Type.STRING },
-             description: { type: Type.STRING },
-             current: { type: Type.INTEGER },
-             required: { type: Type.INTEGER },
-             unit: { type: Type.STRING },
-             isCompleted: { type: Type.BOOLEAN }
-           },
-           required: ["id", "name", "description", "current", "required", "unit", "isCompleted"]
-        }
-      },
-      cheatDetected: { type: Type.BOOLEAN },
-      isGodMode: { type: Type.BOOLEAN }
+      quests: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { id: { type: Type.STRING }, name: { type: Type.STRING }, current: { type: Type.INTEGER }, required: { type: Type.INTEGER }, isCompleted: { type: Type.BOOLEAN } } } }
     },
-    required: ["hp", "maxHp", "mp", "maxMp", "skills", "equippedSkills", "activeEffects", "inventory", "level", "evolutionStage", "quests", "difficulty"],
+    required: ["hp", "maxHp", "mp", "maxMp", "skills", "inventory", "level", "evolutionStage"],
   };
 
-  const result = await executeSmartSwitch<CharacterStatusWithCheat>("Update Status", async (modelId, config) => {
+  const result = await executeSmartSwitch<any>("StatusUpdate", async (ai, modelId, config) => {
     const response = await ai.models.generateContent({
       model: modelId,
       contents: prompt,
-      config: {
-        ...config,
-        responseMimeType: "application/json",
-        responseSchema: schema,
-      },
+      config: { ...config, responseMimeType: "application/json", responseSchema: schema },
     });
-
-    if (response.text) return JSON.parse(response.text);
-    throw new Error("Empty response");
+    return response.text ? JSON.parse(response.text) : null;
   });
 
   return result || character.status;
 };
 
-export interface AppraisalResult {
-  targetName: string;
-  rank: string;
-  description: string;
-  estimatedValue: string;
-}
-
 export const appraiseTarget = async (history: ChatMessage[]): Promise<AppraisalResult | null> => {
-  const recentContext = history.slice(-5).map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
-  const prompt = `Thẩm định đối tượng: ${recentContext}. Trả về JSON.`;
-
-  const schema: Schema = {
-    type: Type.OBJECT,
-    properties: {
-      targetName: { type: Type.STRING },
-      rank: { type: Type.STRING },
-      description: { type: Type.STRING },
-      estimatedValue: { type: Type.STRING },
-    },
-    required: ["targetName", "rank", "description", "estimatedValue"],
-  };
-
-  const result = await executeSmartSwitch<AppraisalResult>("Appraisal", async (modelId, config) => {
+  return await executeSmartSwitch<AppraisalResult>("Appraisal", async (ai, modelId, config) => {
     const response = await ai.models.generateContent({
       model: modelId,
-      contents: prompt,
-      config: {
-        ...config,
+      contents: `Thẩm định đối tượng từ ngữ cảnh: ${history.slice(-5).map(m => m.content).join("\n")}`,
+      config: { 
+        ...config, 
         responseMimeType: "application/json",
-        responseSchema: schema,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            targetName: { type: Type.STRING },
+            rank: { type: Type.STRING },
+            description: { type: Type.STRING },
+            estimatedValue: { type: Type.STRING }
+          },
+          required: ["targetName", "rank", "description", "estimatedValue"]
+        }
       },
     });
-    if (response.text) return JSON.parse(response.text);
-    throw new Error("Empty response");
+    return response.text ? JSON.parse(response.text) : null;
   });
-  return result;
 };
-
-export interface EntityAnalysis {
-  name: string;
-  type: string;
-  description: string;
-  usage: string;
-  origin: string;
-}
 
 export const analyzeEntity = async (term: string): Promise<EntityAnalysis | null> => {
-  const prompt = `Phân tích "${term}". Trả về JSON.`;
-  const schema: Schema = {
-    type: Type.OBJECT,
-    properties: {
-      name: { type: Type.STRING },
-      type: { type: Type.STRING },
-      description: { type: Type.STRING },
-      usage: { type: Type.STRING },
-      origin: { type: Type.STRING },
-    },
-    required: ["name", "type", "description", "usage", "origin"],
-  };
-
-  const result = await executeSmartSwitch<EntityAnalysis>("Analyze Entity", async (modelId, config) => {
+  return await executeSmartSwitch<EntityAnalysis>("Entity", async (ai, modelId, config) => {
     const response = await ai.models.generateContent({
       model: modelId,
-      contents: prompt,
-      config: {
-        ...config,
+      contents: `Phân tích sâu về thực thể/kỹ năng: ${term}`,
+      config: { 
+        ...config, 
         responseMimeType: "application/json",
-        responseSchema: schema,
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            type: { type: Type.STRING },
+            origin: { type: Type.STRING },
+            description: { type: Type.STRING },
+            usage: { type: Type.STRING }
+          },
+          required: ["name", "type", "origin", "description", "usage"]
+        }
       },
     });
-    if (response.text) return JSON.parse(response.text);
-    throw new Error("Empty response");
+    return response.text ? JSON.parse(response.text) : null;
   });
-  return result;
 };
 
-export interface RadarEntity {
-  name: string;
-  magicLevel: 'LOW' | 'MEDIUM' | 'HIGH';
-  distance: string;
-  hostility: string;
-}
-
 export const scanSurroundings = async (history: ChatMessage[]): Promise<RadarEntity[]> => {
-  const recentContext = history.slice(-5).map(m => `${m.role.toUpperCase()}: ${m.content}`).join("\n");
-  const prompt = `Quét xung quanh: ${recentContext}. Trả về JSON ARRAY.`;
-
-  const schema: Schema = {
-    type: Type.ARRAY,
-    items: {
-      type: Type.OBJECT,
-      properties: {
-        name: { type: Type.STRING },
-        magicLevel: { type: Type.STRING, enum: ['LOW', 'MEDIUM', 'HIGH'] },
-        distance: { type: Type.STRING },
-        hostility: { type: Type.STRING },
-      },
-      required: ["name", "magicLevel", "distance", "hostility"],
-    },
-  };
-
-  const result = await executeSmartSwitch<RadarEntity[]>("Radar Scan", async (modelId, config) => {
+  return await executeSmartSwitch<RadarEntity[]>("Radar", async (ai, modelId, config) => {
     const response = await ai.models.generateContent({
       model: modelId,
-      contents: prompt,
-      config: {
-        ...config,
+      contents: `Quét radar ma tố xung quanh: ${history.slice(-5).map(m => m.content).join("\n")}`,
+      config: { 
+        ...config, 
         responseMimeType: "application/json",
-        responseSchema: schema,
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              distance: { type: Type.STRING },
+              hostility: { type: Type.STRING },
+              magicLevel: { type: Type.STRING }
+            },
+            required: ["name", "distance", "hostility", "magicLevel"]
+          }
+        }
       },
     });
-    if (response.text) return JSON.parse(response.text);
-    throw new Error("Empty response");
-  });
-  return result || [];
+    return response.text ? JSON.parse(response.text) : [];
+  }) || [];
 };
