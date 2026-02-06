@@ -1,0 +1,12 @@
+{
+  "name": "Tensura",
+  "description": "An immersive, infinite text-based RPG set in the world of Tensei Shitara Slime Datta Ken. Create your character and forge your own path.",
+  "icons": [
+    {
+      "src": "https://m.media-amazon.com/images/M/MV5BMjZmYjE4YWItMzE5Mi00MTQxLWEzODQtYjg1ZWY2NTM1ZTUyXkEyXkFqcGc@._V1_.jpg",
+      "sizes": "192x192",
+      "type": "image/jpeg"
+    }
+  ],
+  "requestFramePermissions": []
+}
